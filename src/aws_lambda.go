@@ -16,14 +16,13 @@ import (
 	"github.com/chartmuseum/storage"
 	"github.com/urfave/cli"
 	"helm.sh/chartmuseum/pkg/chartmuseum"
-	cm_logger "helm.sh/chartmuseum/pkg/chartmuseum/logger"
-	cm_router "helm.sh/chartmuseum/pkg/chartmuseum/router"
+	"helm.sh/chartmuseum/pkg/chartmuseum/logger"
 	mt "helm.sh/chartmuseum/pkg/chartmuseum/server/multitenant"
 	"helm.sh/chartmuseum/pkg/config"
 )
 
 var httpServer http.Server
-var logs *cm_logger.Logger
+var logs *logger.Logger
 
 func cliHandler(c *cli.Context) {
 	logs.Debug("CLI handler called")
@@ -59,6 +58,7 @@ func cliHandler(c *cli.Context) {
 		ContextPath:            conf.GetString("contextpath"),
 		LogJSON:                conf.GetBool("logjson"),
 		LogHealth:              conf.GetBool("loghealth"),
+		LogLatencyInteger:      conf.GetBool("loglatencyinteger"),
 		Debug:                  conf.GetBool("debug"),
 		EnableAPI:              !conf.GetBool("disableapi"),
 		DisableDelete:          conf.GetBool("disabledelete"),
@@ -80,69 +80,32 @@ func cliHandler(c *cli.Context) {
 		CORSAllowOrigin:        conf.GetString("cors.alloworigin"),
 		WriteTimeout:           conf.GetInt("writetimeout"),
 		ReadTimeout:            conf.GetInt("readtimeout"),
+		EnforceSemver2:         conf.GetBool("enforce-semver2"),
+		CacheInterval:          conf.GetDuration("cacheinterval"),
+		Host:                   conf.GetString("listen.host"),
 	}
 
-	contextPath := strings.TrimSuffix(options.ContextPath, "/")
-	if contextPath != "" && !strings.HasPrefix(contextPath, "/") {
-		contextPath = "/" + contextPath
+	server, err := chartmuseum.NewServer(options)
+	if err != nil {
+		logs.Fatal(err)
 	}
 
-	logs.Debug("Creating Router")
-	router := cm_router.NewRouter(cm_router.RouterOptions{
-		Logger:          logs,
-		Username:        options.Username,
-		Password:        options.Password,
-		ContextPath:     contextPath,
-		TlsCert:         options.TlsCert,
-		TlsKey:          options.TlsKey,
-		TlsCACert:       options.TlsCACert,
-		LogHealth:       options.LogHealth,
-		EnableMetrics:   options.EnableMetrics,
-		AnonymousGet:    options.AnonymousGet,
-		Depth:           options.Depth,
-		MaxUploadSize:   options.MaxUploadSize,
-		BearerAuth:      options.BearerAuth,
-		AuthRealm:       options.AuthRealm,
-		AuthService:     options.AuthService,
-		AuthCertPath:    options.AuthCertPath,
-		DepthDynamic:    options.DepthDynamic,
-		CORSAllowOrigin: options.CORSAllowOrigin,
-		ReadTimeout:     options.ReadTimeout,
-		WriteTimeout:    options.WriteTimeout,
-	})
-
-	logs.Debug("Creating Multi Tenant Server")
-	multiTenantServer, _ := mt.NewMultiTenantServer(mt.MultiTenantServerOptions{
-		Logger:                 logs,
-		Router:                 router,
-		StorageBackend:         options.StorageBackend,
-		ExternalCacheStore:     options.ExternalCacheStore,
-		TimestampTolerance:     options.TimestampTolerance,
-		ChartURL:               strings.TrimSuffix(options.ChartURL, "/"),
-		ChartPostFormFieldName: options.ChartPostFormFieldName,
-		ProvPostFormFieldName:  options.ProvPostFormFieldName,
-		MaxStorageObjects:      options.MaxStorageObjects,
-		IndexLimit:             options.IndexLimit,
-		GenIndex:               options.GenIndex,
-		EnableAPI:              options.EnableAPI,
-		DisableDelete:          options.DisableDelete,
-		UseStatefiles:          options.UseStatefiles,
-		AllowOverwrite:         options.AllowOverwrite,
-		AllowForceOverwrite:    options.AllowForceOverwrite,
-	})
-
+	multiTenantServer := server.(*mt.MultiTenantServer)
 	logs.Debug(multiTenantServer)
 
 	httpServer = http.Server{
 		Addr:         fmt.Sprintf("%s:%d", "www.example.com", conf.GetInt("port")),
-		Handler:      router,
-		ReadTimeout:  router.ReadTimeout,
-		WriteTimeout: router.WriteTimeout,
+		Handler:      multiTenantServer.Router,
+		ReadTimeout:  multiTenantServer.Router.ReadTimeout,
+		WriteTimeout: multiTenantServer.Router.WriteTimeout,
 	}
 
 	logs.Debug("Starting Server")
-	httpServer.ListenAndServe()
+	if err = httpServer.ListenAndServe(); err != nil {
+		logs.Fatal(err)
+	}
 }
+
 func startChartMuseum() {
 	logs.Debug("startChartMuseum called")
 
@@ -150,7 +113,7 @@ func startChartMuseum() {
 	args = append(args, "--gen-index")
 	app := cli.NewApp()
 	app.Name = "ChartMuseum"
-	app.Version = fmt.Sprintf("%s", "v0.12.0")
+	app.Version = fmt.Sprintf("%s", "v0.13.1")
 	app.Usage = "Helm Chart Repository with support for Amazon S3, Google Cloud Storage, Oracle Cloud Infrastructure Object Storage and Openstack"
 	app.Action = cliHandler
 	app.Flags = config.CLIFlags
@@ -158,7 +121,6 @@ func startChartMuseum() {
 }
 
 func waitForServer() {
-
 	logs.Debug("Waiting for http server to spin up")
 	for reflect.ValueOf(httpServer).IsZero() {
 		time.Sleep(100 * time.Millisecond)
@@ -168,7 +130,7 @@ func handleRequest(req events.APIGatewayProxyRequest) (events.APIGatewayProxyRes
 	waitForServer()
 
 	logs.Debug(req.Path)
-	path := fmt.Sprintf("%s%s", req.RequestContext.DomainName, req.Path)
+	path := fmt.Sprintf("%s%s", req.RequestContext, req.Path) //todo: fix
 
 	logs.Debug(path)
 	logs.Debug(req.Body)
@@ -218,15 +180,12 @@ func handleRequest(req events.APIGatewayProxyRequest) (events.APIGatewayProxyRes
 
 	return returnProxyResult, nil
 }
-func debugEnabled() bool {
-	return os.Getenv("LOG_LEVEL") == "DEBUG"
-}
 
 func main() {
-
-	logs, _ = cm_logger.NewLogger(cm_logger.LoggerOptions{
-		Debug:   debugEnabled(),
-		LogJSON: false,
+	conf := config.NewConfig()
+	logs, _ = logger.NewLogger(logger.LoggerOptions{
+		Debug:   os.Getenv("LOG_LEVEL") == "DEBUG",
+		LogJSON: conf.GetBool("logjson"),
 	})
 
 	logs.Debug("Lambda called")
