@@ -1,0 +1,24 @@
+name: build-test-latest
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - uses: actions/setup-go@v2
+        with:
+          go-version: '^1.15.6'
+      - run: go version
+      - run: go build -o main src/aws_lambda.go
+      - uses: actions/upload-artifact@v2
+        with:
+          name: main
+          path: main
+      - uses: ncipollo/release-action@v1
+        with:
+          artifacts: "main"
+          name: "latest-build"
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
